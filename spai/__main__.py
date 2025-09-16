@@ -523,7 +523,14 @@ def infer(
     criterion = losses.build_loss(config)
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_cls_model(config)
-    model.cuda()
+    # Select device: prefer MPS if available, then CUDA, else CPU.
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    model.to(device)
     load_pretrained(config, model, logger,  checkpoint_path=model_ckpt, verbose=False)
 
     # Infer predictions and compute performance metrics (only on csv inputs with ground-truths).
@@ -1115,6 +1122,9 @@ def validate(
     model.eval()
     criterion.eval()
 
+    # Resolve runtime device from model
+    device = next(model.parameters()).device
+
     batch_time = AverageMeter()
     loss_meter = AverageMeter()
     cls_metrics: metrics.Metrics = metrics.Metrics(metrics=("auc", "ap", "accuracy"))
@@ -1125,12 +1135,13 @@ def validate(
     for idx, (images, target, dataset_idx) in enumerate(data_loader):
         if isinstance(images, list):
             # In case of arbitrary resolution models the batch is provided as a list of tensors.
-            images = [img.cuda(non_blocking=True) for img in images]
+            images = [img.to(device=device, dtype=torch.float32, non_blocking=True) for img in images]
             # Remove views dimension. Always 1 during inference.
             images = [img.squeeze(dim=1) for img in images]
         else:
-            images = images.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+            images = images.to(device=device, dtype=torch.float32, non_blocking=True)
+        # Ensure targets are float32 for BCE and avoid MPS float64 move
+        target = target.to(device=device, dtype=torch.float32, non_blocking=True)
 
         # Compute output.
         if isinstance(images, list) and config.TEST.EXPORT_IMAGE_PATCHES:
@@ -1184,7 +1195,10 @@ def validate(
         end = time.time()
 
         if idx % config.PRINT_FREQ == 0 and verbose:
-            memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+            memory_used = (
+                torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+                if torch.cuda.is_available() else 0.0
+            )
             logger.info(
                 f'Test: [{idx}/{len(data_loader)}] | '
                 f'Time {batch_time.val:.3f} ({batch_time.avg:.3f}) | '
